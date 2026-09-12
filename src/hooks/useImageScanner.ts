@@ -4,6 +4,7 @@ import type {
   ProtectionMode,
   ScanPhase,
   ScanResult,
+  SensitiveRegion,
   SensitiveType,
 } from '../types/scanner'
 import { scanImage } from '../lib/mockScanner'
@@ -61,6 +62,8 @@ interface RunOptions {
   enabledTypes: SensitiveType[]
   mode: ProtectionMode
   reducedMotion: boolean
+  /** Optional exact regions (demo generator / real vision backend). */
+  regions?: SensitiveRegion[]
 }
 
 export function useImageScanner() {
@@ -103,6 +106,7 @@ export function useImageScanner() {
         width: dims.width,
         height: dims.height,
         enabledTypes: opts.enabledTypes,
+        regions: opts.regions,
       })
 
       const scanDuration = opts.reducedMotion ? 600 : 2600

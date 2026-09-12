@@ -3,6 +3,7 @@ import type {
   ScanImageInput,
   ScanResult,
   ScannerEngine,
+  SensitiveRegion,
   SensitiveType,
   Severity,
 } from '../types/scanner'
@@ -101,6 +102,58 @@ function buildDetections(enabled: SensitiveType[]): Detection[] {
   }))
 }
 
+/**
+ * Masks a concrete sensitive value, preserving its shape so the report reads
+ * naturally (e.g. keeps the last 4 digits of a card, the email host initial).
+ * The full raw value is never surfaced.
+ */
+function maskText(type: SensitiveType, raw: string): string {
+  const digits = raw.replace(/\D/g, '')
+  switch (type) {
+    case 'AADHAAR':
+      return 'XXXX XXXX ' + (digits.slice(-4) || 'XXXX')
+    case 'CREDIT_CARD':
+    case 'DEBIT_CARD':
+      return 'XXXX XXXX XXXX ' + (digits.slice(-4) || 'XXXX')
+    case 'PHONE':
+      return '+•• •••••' + (digits.slice(-5) || '•••••')
+    case 'API_KEY':
+      return raw.slice(0, 3) + '-••••••••••••'
+    case 'ACCESS_TOKEN':
+      return raw.slice(0, 4) + '••••••••••••'
+    case 'JWT_TOKEN':
+      return 'eyJ••••.••••••.••••'
+    case 'PASSWORD':
+      return '•'.repeat(Math.min(12, Math.max(8, raw.length)))
+    case 'EMAIL': {
+      const [user = '', host = ''] = raw.split('@')
+      return (user.slice(0, 1) || '•') + '•••@' + (host.slice(0, 1) || '•') + '••.•••'
+    }
+    case 'ADDRESS':
+      return (raw.split(/[, ]/)[0] || '•••') + ' •••••••, •••'
+    default:
+      return maskedFor(type)
+  }
+}
+
+/** Builds detections directly from exact regions (demo / real backend). */
+function buildFromRegions(
+  regions: SensitiveRegion[],
+  enabled: SensitiveType[],
+): Detection[] {
+  return regions
+    .filter((r) => enabled.includes(r.detectedType))
+    .map((r) => ({
+      id: rid('DET'),
+      detectedType: r.detectedType,
+      boundingBox: r.boundingBox,
+      confidence: Math.round(r.confidence * 10) / 10,
+      maskedValue: maskText(r.detectedType, r.text),
+      severity: TYPE_META[r.detectedType].severity,
+      protected: false,
+    }))
+}
+
 function computeScore(detections: Detection[]): number {
   if (detections.length === 0) return 100
   // Every detection that gets cloaked keeps the score high; the model reports a
@@ -115,7 +168,12 @@ function computeScore(detections: Detection[]): number {
 
 export class MockScanner implements ScannerEngine {
   async scanImage(input: ScanImageInput): Promise<ScanResult> {
-    const detections = buildDetections(input.enabledTypes)
+    // Prefer exact regions (from the demo generator or a real vision backend);
+    // fall back to heuristic templates for arbitrary uploaded images.
+    const detections =
+      input.regions && input.regions.length > 0
+        ? buildFromRegions(input.regions, input.enabledTypes)
+        : buildDetections(input.enabledTypes)
     // simulate compute latency (not the animation timing — that's UI driven)
     const latencyMs = 120 + Math.floor(Math.random() * 80)
     return {
