@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import time
-from typing import Optional
+from typing import Callable, Optional
 
 from PIL import Image
 
@@ -13,8 +13,10 @@ from ..schemas import (
     ScanResponse,
     Summary,
 )
+from ..logging_util import debug, info, mask_for_log
 from .detectors import SEVERITY_BY_TYPE, detect_text
 from .locate import Box, LocatedDetection, Token, locate
+from .ocr import extract_tokens, ocr_crop_text, ocr_unavailable_reason
 from .protect import apply_protection, decode_image, encode_image, mask_value
 from .verify import MAX_ATTEMPTS, original_detail_for, verify_region
 
@@ -28,17 +30,20 @@ def _enabled_set(req: ScanRequest) -> Optional[set[str]]:
     return {t.strip().upper() for t in req.enabled_types if t.strip()}
 
 
-def _detect_from_tokens(req: ScanRequest, enabled: Optional[set[str]]) -> list[LocatedDetection]:
-    tokens = [
+def _locate_tokens(
+    tokens: list[Token],
+    enabled: Optional[set[str]],
+    img_w: Optional[float],
+    img_h: Optional[float],
+) -> list[LocatedDetection]:
+    return locate(tokens, enabled, img_w=img_w, img_h=img_h)
+
+
+def _tokens_from_request(req: ScanRequest) -> list[Token]:
+    return [
         Token(text=t.text, box=Box(t.bbox[0], t.bbox[1], t.bbox[2], t.bbox[3]))
         for t in (req.tokens or [])
     ]
-    return locate(
-        tokens,
-        enabled,
-        img_w=float(req.image_width) if req.image_width else None,
-        img_h=float(req.image_height) if req.image_height else None,
-    )
 
 
 def _detect_from_text(req: ScanRequest, enabled: Optional[set[str]]) -> list[LocatedDetection]:
@@ -69,19 +74,49 @@ def run_pipeline(req: ScanRequest) -> ScanResponse:
     start = time.perf_counter()
     enabled = _enabled_set(req)
 
-    # ---- DETECT + LOCATE --------------------------------------------------
-    if req.tokens:
-        detections = _detect_from_tokens(req, enabled)
-    else:
-        detections = _detect_from_text(req, enabled)
-
-    # ---- PROTECT (+ VERIFY with escalation) -------------------------------
+    # Decode the source image up front so OCR, protection and re-OCR all share
+    # the same PIL object (and the same pixel coordinate space).
     img: Optional[Image.Image] = None
     if req.image_base64:
         try:
             img = decode_image(req.image_base64)
         except Exception:
             img = None
+            info("failed to decode image_base64; treating as no image")
+
+    img_w = float(req.image_width) if req.image_width else (float(img.width) if img else None)
+    img_h = float(req.image_height) if req.image_height else (float(img.height) if img else None)
+
+    # ---- OCR -> DETECT -> LOCATE ------------------------------------------
+    # Token source priority:
+    #   1. explicit OCR tokens supplied by the caller (contract preserved)
+    #   2. tokens extracted from the image via Tesseract (new)
+    #   3. raw text (no spatial boxes)
+    if req.tokens:
+        tokens = _tokens_from_request(req)
+        debug("using %d caller-supplied OCR tokens", len(tokens))
+        detections = _locate_tokens(tokens, enabled, img_w, img_h)
+    elif img is not None:
+        reason = ocr_unavailable_reason()
+        if reason:
+            info("OCR requested but unavailable: %s", reason)
+            detections = []
+        else:
+            tokens = extract_tokens(img)
+            debug("Tesseract produced %d tokens", len(tokens))
+            detections = _locate_tokens(tokens, enabled, img_w, img_h)
+    else:
+        detections = _detect_from_text(req, enabled)
+
+    # ---- PROTECT (+ VERIFY with escalation) -------------------------------
+    # Real re-OCR verifier: verify_region crops the (now-masked) region and
+    # hands the crop here; we OCR it and return the recognized text. If that
+    # text still contains the sensitive value, verify_region reports failure
+    # and the protect loop escalates. When Tesseract is unavailable we pass
+    # None, so verify_region uses its structural fallback.
+    ocr_verifier: Optional[Callable[[Image.Image], str]] = (
+        ocr_crop_text if (img is not None and ocr_unavailable_reason() is None) else None
+    )
 
     out_detections: list[DetectionOut] = []
     protected_flags: list[bool] = []
@@ -97,10 +132,18 @@ def run_pipeline(req: ScanRequest) -> ScanResponse:
             for attempt in range(1, MAX_ATTEMPTS + 1):
                 attempts = attempt
                 apply_protection(img, det, req.mode.value, attempt=attempt)
-                if verify_region(img, det, original_detail):
+                # Verify with real re-OCR when Tesseract is available; the
+                # structural detail check remains the fallback inside
+                # verify_region when ocr_fn is None.
+                if verify_region(img, det, original_detail, ocr_fn=ocr_verifier):
                     verified = True
                     break
             status = "protected"
+            if not verified:
+                debug(
+                    "region for %s still detectable after %d attempts",
+                    det.type, attempts,
+                )
         elif has_box:
             # No image supplied but we have coordinates: region is located and
             # will be protected client-side; mark protected, verification N/A.

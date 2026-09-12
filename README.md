@@ -33,9 +33,11 @@ npm run preview  # preview the production build
 ## Backend engine (optional)
 
 A real detection & redaction service lives in [`backend/`](backend/README.md) —
-a FastAPI implementation of the **DETECT → LOCATE → PROTECT → VERIFY** pipeline
-(regex + Luhn/Verhoeff validation, OCR-token merging, IoU bbox union, adaptive
-Pillow obfuscation). The frontend uses the in-browser mock by default; set
+a FastAPI implementation of the **IMAGE → OCR → DETECT → LOCATE → PROTECT →
+VERIFY** pipeline (Tesseract OCR, regex + Luhn/Verhoeff validation, OCR-token
+merging, IoU bbox union, adaptive Pillow obfuscation, re-OCR verification). It
+extracts sensitive data from uploaded images server-side — the frontend never
+runs OCR. The frontend uses the in-browser mock by default; set
 `VITE_USE_REAL_BACKEND=true` (see `.env.example`) to route scans to it.
 
 ## How It Works
