@@ -38,6 +38,8 @@ class Box:
 class Token:
     text: str
     box: Box
+    # OCR confidence (0..100) when the token came from Tesseract; -1 otherwise.
+    confidence: float = -1.0
 
 
 @dataclass
