@@ -13,8 +13,35 @@ JSON contract. The frontend never has to run OCR.
 | Stage | Module | What it does |
 |-------|--------|--------------|
 | **OCR** | `app/pipeline/ocr.py` | Runs Tesseract via `pytesseract.image_to_data` when an image is supplied and no tokens were given. Emits tokens with `text`, pixel `bbox [x,y,w,h]` and `confidence`. Degrades gracefully to no-op if the binary is missing. |
-| **DETECT** | `app/pipeline/detectors.py`, `validators.py` | Regex pattern library over text; **Luhn** (cards) and **Verhoeff** (Aadhaar) checksum validation; context-keyword scoring; overlap resolution. |
-| **LOCATE** | `app/pipeline/locate.py` | Groups OCR tokens into lines, merges horizontally adjacent tokens (e.g. `7730 \| 0889 \| 2163` → one candidate), unions contributing token boxes (IoU-style) into ONE bbox, and pads it 10–15% of text height. |
+| **DETECT** | `app/pipeline/detectors.py`, `validators.py`, `context.py` | Regex pattern library + **Luhn**/**Verhoeff**/IPv4 validation, feeding a **context-aware confidence model** (see below): candidates are scored on intrinsic evidence *and* surrounding keywords, with negative-context suppression and a redaction threshold. |
+| **LOCATE** | `app/pipeline/locate.py` | Groups OCR tokens into lines, merges horizontally adjacent tokens (e.g. `7730 \| 0889 \| 2163` → one candidate), **reconstructs numbers split across stacked lines**, pulls in **label text from nearby lines as spatial context** (LABEL-above-VALUE layouts), unions contributing boxes into ONE bbox, and pads it 10–15% of text height. |
+
+### Context-aware detection (`context.py`)
+
+The detector does not ask "does this match a regex?" but "is this candidate
+*structurally consistent* with sensitive data, and does the surrounding OCR /
+visual context corroborate that?". An additive point model combines:
+
+| Signal | Weight |
+|--------|--------|
+| pattern match | +20 |
+| strong validation (Luhn / Verhoeff / IPv4) | +40 |
+| strong context keyword (e.g. "debit card number", "aadhaar", "cvv") | +30 |
+| medium context ("card", "account", "bank") | +15 |
+| weak context ("id", "number") | +6 |
+| spatial proximity to a keyword | +10 |
+| multiple corroborating cues | +10 |
+| negative context ("order number", "invoice", "reference") | −30 |
+| failed validation | −30 (−12 when a strong label is present) |
+| bare numeric, no corroboration | −20 |
+
+The final 0–100 score is normalized to a `0..1` confidence; a candidate is only
+redacted when it clears `REDACT_THRESHOLD` (default 45). This gives high recall
+for genuinely sensitive values while suppressing order/invoice/account numbers,
+dates, CVV-shaped 3-digit numbers without card context, etc. The keyword
+dictionary (`CONTEXT`) and `NEGATIVE_CONTEXT` list are centralized and easily
+extended. Every detection records human-readable `signals` explaining *why* it
+was flagged — never the raw value.
 | **PROTECT** | `app/pipeline/protect.py` | Masks the reported text (never raw); applies adaptive Pillow obfuscation — frosted glass / deep blur for **critical**, strong blur/pixelation for **high**, moderate blur otherwise. |
 | **VERIFY** | `app/pipeline/verify.py` | After masking, **re-OCRs the redacted region with Tesseract** and re-runs detection on the recovered text; if the value is still readable, protection strength escalates and retries (max 3 attempts). When Tesseract is unavailable it falls back to a structural check that the region's pixels were substantially degraded. |
 

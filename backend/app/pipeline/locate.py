@@ -49,6 +49,8 @@ class LocatedDetection:
     confidence: float
     value: str
     box: Box
+    # Human-readable evidence for the classification (never the raw value).
+    signals: tuple[str, ...] = ()
 
 
 def _y_overlap(a: Box, b: Box) -> float:
@@ -120,17 +122,55 @@ def pad_box(box: Box, ratio: float = 0.12, img_w: float | None = None,
     return Box(x, max(0.0, y), max(0.0, w), h)
 
 
+def _line_box(line: list[Token]) -> Box:
+    return union_box([t.box for t in line])
+
+
+def _spatial_context_prefix(line: list[Token], all_lines: list[list[Token]]) -> str:
+    """Collect text from lines that are the *label* for ``line``.
+
+    Handles the common "LABEL: VALUE" and stacked "LABEL \\n VALUE" layouts by
+    pulling in the text of lines that sit directly above (and vertically close)
+    or that share the block — so a label like "Aadhaar Number" one line above
+    the digits still counts as context (§4). Kept intentionally simple and
+    local; no full layout engine.
+    """
+    lb = _line_box(line)
+    line_h = lb.h if lb.h > 0 else 1.0
+    prefix_words: list[str] = []
+    for other in all_lines:
+        if other is line:
+            continue
+        ob = _line_box(other)
+        vertical_gap = lb.y - ob.y2  # >0 when `other` is above `line`
+        # A label directly above within ~2 line-heights, roughly x-aligned.
+        above = -0.5 * line_h <= vertical_gap <= 2.5 * line_h
+        x_overlap = min(lb.x2, ob.x2) - max(lb.x, ob.x)
+        near_x = x_overlap > -3 * line_h  # tolerant horizontal alignment
+        if above and near_x:
+            prefix_words.append(" ".join(t.text for t in other))
+    return " ".join(prefix_words)
+
+
 def locate(tokens: list[Token], enabled_types: set[str] | None,
            img_w: float | None = None, img_h: float | None = None,
            pad_ratio: float = 0.12) -> list[LocatedDetection]:
-    """Reconstruct lines, detect, union contributing boxes, and pad."""
+    """Reconstruct lines, detect with spatial context, union boxes, and pad."""
     located: list[LocatedDetection] = []
+    lines = group_into_lines(tokens)
 
-    for line in group_into_lines(tokens):
+    for line in lines:
+        # Spatial context: prepend label text from nearby lines so a candidate
+        # sees its label even when OCR put it on a separate line. The prefix is
+        # separated so the value's own char spans start after it.
+        prefix = _spatial_context_prefix(line, lines)
+        prefix_str = (prefix + " \n ") if prefix else ""
+        offset = len(prefix_str)
+
         # Build the merged line string and a char-offset -> token index map.
         parts: list[str] = []
         spans: list[tuple[int, int]] = []  # (start, end) per token in merged string
-        cursor = 0
+        cursor = offset
         for i, tok in enumerate(line):
             if i > 0:
                 parts.append(" ")
@@ -139,25 +179,136 @@ def locate(tokens: list[Token], enabled_types: set[str] | None,
             parts.append(tok.text)
             cursor += len(tok.text)
             spans.append((start, cursor))
-        merged = "".join(parts)
+        merged = prefix_str + "".join(parts)
 
         for match in detect_text(merged, enabled_types):
+            # Ignore matches that fall entirely inside the context prefix
+            # (that text belongs to a different line and is handled there).
+            if match.end <= offset:
+                continue
             boxes = _tokens_for_span(line, spans, match)
             if not boxes:
                 continue
-            u = union_box(boxes)
-            u = pad_box(u, pad_ratio, img_w, img_h)
+            u = pad_box(union_box(boxes), pad_ratio, img_w, img_h)
             located.append(
                 LocatedDetection(
-                    type=match.type,
-                    severity=match.severity,
-                    confidence=match.confidence,
-                    value=match.value,
-                    box=u,
+                    type=match.type, severity=match.severity,
+                    confidence=match.confidence, value=match.value,
+                    box=u, signals=match.signals,
                 )
             )
 
+    # Cross-line reconstruction for numbers split across stacked lines.
+    located.extend(
+        _reconstruct_cross_line(lines, enabled_types, img_w, img_h, pad_ratio)
+    )
+
     return _dedupe(located)
+
+
+def _is_numeric_token(text: str) -> bool:
+    digits = sum(c.isdigit() for c in text)
+    return digits >= 2 and digits >= len(text) - 1  # mostly digits
+
+
+def _is_card_group_token(text: str) -> bool:
+    """A token shaped like a card/Aadhaar group: exactly 3-4 digits, no '/'.
+
+    Excludes date fragments (``09/29``) and stray short numbers so cross-line
+    reconstruction only ever stitches genuine card/Aadhaar groups together.
+    """
+    if "/" in text:
+        return False
+    core = text.strip()
+    return core.isdigit() and 3 <= len(core) <= 4
+
+
+def _reconstruct_cross_line(
+    lines: list[list[Token]],
+    enabled_types: set[str] | None,
+    img_w: float | None,
+    img_h: float | None,
+    pad_ratio: float,
+) -> list[LocatedDetection]:
+    """Merge digit tokens from vertically-stacked lines into one candidate.
+
+    Handles layouts where a card / Aadhaar number wraps across lines::
+
+        Card Number
+        5264 1234
+        5678 9012
+
+    Consecutive lines that are predominantly numeric and vertically close are
+    concatenated; the combined digit string is re-run through the detectors
+    (with the label lines as spatial context), and every contributing token box
+    is unioned into one region.
+    """
+    out: list[LocatedDetection] = []
+    if len(lines) < 2:
+        return out
+
+    n = len(lines)
+    for i in range(n):
+        numeric_run: list[list[Token]] = []
+        j = i
+        prev_box: Box | None = None
+        while j < n:
+            line = lines[j]
+            # A reconstructable line is composed *entirely* of card/Aadhaar
+            # group tokens (3-4 digits). A "CVV: 482" or "Expiry: 09/29" line
+            # contains a label / slash and is therefore excluded.
+            group_toks = [t for t in line if _is_card_group_token(t.text)]
+            if not group_toks or len(group_toks) != len(line):
+                break
+            num_toks = group_toks
+            lb = _line_box(line)
+            if prev_box is not None:
+                gap = lb.y - prev_box.y2
+                if gap > 1.6 * max(lb.h, 1.0):  # too far apart vertically
+                    break
+            numeric_run.append(num_toks)
+            prev_box = lb
+            j += 1
+        if len(numeric_run) < 2:
+            continue
+
+        # Concatenate digit tokens across the run, tracking contributing boxes.
+        contributing: list[Box] = []
+        digit_parts: list[str] = []
+        for ln in numeric_run:
+            for t in ln:
+                digit_parts.append(t.text)
+                contributing.append(t.box)
+        merged_value = " ".join(digit_parts)
+
+        # Spatial context: the label sits above the first numeric line.
+        prefix = _spatial_context_prefix(numeric_run[0], lines)
+        probe = (prefix + " \n " + merged_value) if prefix else merged_value
+
+        for match in detect_text(probe, enabled_types):
+            # Reconstruction targets long numeric identifiers that wrap across
+            # lines (cards, Aadhaar). Phone/other shorter numerics are handled
+            # by the per-line pass, so don't resurrect them here.
+            if match.type not in ("CREDIT_CARD", "DEBIT_CARD", "AADHAAR"):
+                continue
+            digits_only = "".join(c for c in match.value if c.isdigit())
+            if len(digits_only) < 12:
+                continue
+            # Only trust a cross-line merge when the reconstructed value is
+            # genuinely a card/Aadhaar: it must pass its checksum, otherwise a
+            # coincidental stack of unrelated numeric lines (CVV + expiry) could
+            # masquerade as a card. Validation is the deciding evidence here.
+            if "strong validation passed" not in match.signals:
+                continue
+            u = pad_box(union_box(contributing), pad_ratio, img_w, img_h)
+            out.append(
+                LocatedDetection(
+                    type=match.type, severity=match.severity,
+                    confidence=match.confidence, value=match.value,
+                    box=u, signals=match.signals + ("reconstructed across lines",),
+                )
+            )
+    return out
 
 
 def _tokens_for_span(line: list[Token], spans: list[tuple[int, int]],

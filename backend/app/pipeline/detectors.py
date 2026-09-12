@@ -11,6 +11,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
+from .context import score_candidate
 from .validators import is_valid_ipv4, luhn_check, verhoeff_check
 
 
@@ -22,6 +23,8 @@ class Match:
     end: int
     value: str
     confidence: float
+    # Human-readable evidence for *why* this was flagged (never the raw value).
+    signals: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -36,6 +39,11 @@ class PatternDef:
     # ``require_valid`` is True; otherwise just lower confidence.
     require_valid: bool = False
     context_keywords: tuple[str, ...] = field(default_factory=tuple)
+    # When True, the ``regex`` matches a *label* anchor (e.g. "CVV") and the
+    # actual sensitive value is found by ``value_regex`` immediately after it.
+    # The detection is dropped unless card/related context is present.
+    require_context: bool = False
+    value_regex: Optional[re.Pattern] = None
 
 
 # ---------------------------------------------------------------------------
@@ -83,6 +91,22 @@ PATTERNS: list[PatternDef] = [
         _P(r"\b(?:\d[ -]?){12,18}\d\b"),
         0.9, validator=luhn_check, require_valid=True,
         context_keywords=("card", "credit", "debit", "visa", "mastercard", "cvv"),
+    ),
+    # CVV / expiry are only meaningful near card context; ``require_context``
+    # means they are dropped unless the context model finds card keywords, so
+    # they never fire on a random 3-digit number or an arbitrary date.
+    PatternDef(
+        "CVV", "high",
+        _P(r"(?i)\b(?:cvv|cvc|card verification(?:\s+value)?)\b"),  # label anchor
+        0.5, context_keywords=("cvv", "cvc"), require_context=True,
+        value_regex=_P(r"\d{3,4}"),
+    ),
+    PatternDef(
+        "CARD_EXPIRY", "medium",
+        _P(r"(?i)\b(?:valid\s+thru|valid\s+through|expiry|expiration|exp)\b"),
+        0.5, context_keywords=("expiry", "expiration", "valid thru", "valid through"),
+        require_context=True,
+        value_regex=_P(r"(0[1-9]|1[0-2])\s*/\s*\d{2,4}"),
     ),
     PatternDef(
         "IBAN", "high",
@@ -170,39 +194,73 @@ PATTERNS: list[PatternDef] = [
 # Fast lookup for severity by type (also used by LOCATE / VERIFY).
 SEVERITY_BY_TYPE: dict[str, str] = {p.type: p.severity for p in PATTERNS}
 
-CONTEXT_WINDOW = 40  # chars on each side to scan for context keywords
+# Character window each side of a candidate scanned for context keywords. Used
+# for the text path; the spatial (LOCATE) path augments this window with tokens
+# from spatially-near lines before calling detect_text.
+CONTEXT_WINDOW = 48
+
+# Types that are just a bare numeric run with no distinctive structure — these
+# get the weak-random penalty unless corroborated.
+_BARE_NUMERIC_TYPES = frozenset({"AADHAAR", "CREDIT_CARD", "DEBIT_CARD", "PHONE"})
 
 
-def _has_context(text: str, start: int, end: int, keywords: tuple[str, ...]) -> bool:
-    if not keywords:
-        return False
+def _context_window(text: str, start: int, end: int) -> str:
     lo = max(0, start - CONTEXT_WINDOW)
     hi = min(len(text), end + CONTEXT_WINDOW)
-    window = text[lo:hi].lower()
-    return any(k in window for k in keywords)
+    return text[lo:hi]
 
 
-def _score(pattern: PatternDef, text: str, start: int, end: int, value: str) -> Optional[float]:
-    """Compute final confidence for a raw match, or None to reject it."""
-    conf = pattern.base_confidence
-    has_ctx = _has_context(text, start, end, pattern.context_keywords)
+def _adjacent_keyword(text: str, start: int, end: int, keywords: tuple[str, ...]) -> bool:
+    """True if a keyword sits in the tight window immediately around the value."""
+    lo = max(0, start - 20)
+    hi = min(len(text), end + 12)
+    tight = " ".join(text[lo:hi].lower().split())
+    return any(k in tight for k in keywords)
 
+
+def _score(
+    pattern: PatternDef, text: str, start: int, end: int, value: str
+) -> Optional[tuple[float, tuple[str, ...]]]:
+    """Return (confidence 0..1, signals) for a match, or None to reject it.
+
+    Delegates the additive scoring to the context model while preserving the
+    original guarantees: ``require_valid`` types are dropped on failed checksum.
+    """
+    validated: Optional[bool] = None
     if pattern.validator is not None:
-        ok = pattern.validator(value)
-        if ok:
-            conf = min(0.99, conf + 0.08)
-        elif pattern.require_valid:
-            return None
-        else:
-            # Failed a non-mandatory checksum: penalize, but less so when strong
-            # context is present (OCR noise shouldn't discard a labelled field).
-            conf = max(0.3, conf - (0.18 if has_ctx else 0.35))
+        validated = bool(pattern.validator(value))
+        if not validated and pattern.require_valid:
+            return None  # e.g. a non-Luhn 16-digit run is never a card
 
-    # Context scoring: nearby keywords meaningfully raise confidence so a
-    # context-anchored type wins overlaps against generic numeric patterns.
-    if has_ctx:
-        conf = min(0.99, conf + 0.15)
-    return round(conf, 4)
+    window = _context_window(text, start, end)
+    kws = pattern.context_keywords
+    adjacent = _adjacent_keyword(text, start, end, kws) if kws else False
+
+    scored = score_candidate(
+        pattern.type,
+        pattern_matched=True,
+        validated=validated,
+        context_window=window,
+        adjacent=adjacent,
+        is_bare_numeric=pattern.type in _BARE_NUMERIC_TYPES,
+    )
+
+    # Blend the model score with the pattern's intrinsic base confidence.
+    #
+    # Highly-specific patterns (JWT, private key, email, PAN, ...) carry little
+    # ambiguity, so they keep their strong prior via max(). But ambiguous
+    # bare-numeric types (phone / card / Aadhaar) must be governed by the
+    # context model — otherwise a contextless phone-shaped number would always
+    # win on its base prior and out-rank a context-anchored Aadhaar on the same
+    # span. For those, we trust the model score directly.
+    if pattern.type in _BARE_NUMERIC_TYPES:
+        conf = scored.confidence
+    elif validated is False:
+        conf = scored.confidence
+    else:
+        conf = max(scored.confidence, pattern.base_confidence)
+    conf = round(min(0.99, conf), 4)
+    return conf, tuple(scored.signals)
 
 
 def detect_text(text: str, enabled_types: Optional[set[str]] = None) -> list[Match]:
@@ -214,6 +272,11 @@ def detect_text(text: str, enabled_types: Optional[set[str]] = None) -> list[Mat
     for pattern in PATTERNS:
         if enabled_types is not None and pattern.type not in enabled_types:
             continue
+
+        if pattern.require_context and pattern.value_regex is not None:
+            raw.extend(_detect_label_anchored(pattern, text))
+            continue
+
         for m in pattern.regex.finditer(text):
             # Prefer a capture group when the pattern defines one (e.g. PASSWORD).
             if m.groups():
@@ -222,12 +285,48 @@ def detect_text(text: str, enabled_types: Optional[set[str]] = None) -> list[Mat
             else:
                 value = m.group(0)
                 start, end = m.start(0), m.end(0)
-            conf = _score(pattern, text, start, end, value)
-            if conf is None:
+            result = _score(pattern, text, start, end, value)
+            if result is None:
                 continue
-            raw.append(Match(pattern.type, pattern.severity, start, end, value, conf))
+            conf, signals = result
+            raw.append(
+                Match(pattern.type, pattern.severity, start, end, value, conf, signals)
+            )
 
     return _resolve_overlaps(raw)
+
+
+def _detect_label_anchored(pattern: PatternDef, text: str) -> list[Match]:
+    """Detect label-anchored values (CVV, expiry): the value must sit right
+    after a card/related label, and card context must be present. This is what
+    stops every 3-digit number or date from being flagged."""
+    out: list[Match] = []
+    assert pattern.value_regex is not None
+    for label in pattern.regex.finditer(text):
+        # Look for the value within a short span after the label.
+        search_lo = label.end()
+        search_hi = min(len(text), label.end() + 24)
+        vm = pattern.value_regex.search(text, search_lo, search_hi)
+        if not vm:
+            continue
+        value = vm.group(0)
+        window = _context_window(text, label.start(), vm.end())
+        scored = score_candidate(
+            pattern.type,
+            pattern_matched=True,
+            validated=None,
+            context_window=window,
+            adjacent=True,  # value is by construction adjacent to its label
+        )
+        # Require real card context (strong or medium tier present).
+        if not scored.signals or all("context" not in s for s in scored.signals):
+            continue
+        conf = round(min(0.99, max(scored.confidence, 0.6)), 4)
+        out.append(
+            Match(pattern.type, pattern.severity, vm.start(), vm.end(),
+                  value, conf, tuple(scored.signals))
+        )
+    return out
 
 
 def _resolve_overlaps(matches: list[Match]) -> list[Match]:
