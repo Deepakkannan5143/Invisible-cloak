@@ -166,6 +166,8 @@ function computeScore(detections: Detection[]): number {
   return Math.min(99, 100 - residual)
 }
 
+import { RealScanner } from './realScanner'
+
 export class MockScanner implements ScannerEngine {
   async scanImage(input: ScanImageInput): Promise<ScanResult> {
     // Prefer exact regions (from the demo generator or a real vision backend);
@@ -188,7 +190,22 @@ export class MockScanner implements ScannerEngine {
 
 export const scanner: ScannerEngine = new MockScanner()
 
-/** Convenience wrapper used by hooks/components. */
+// Select the active engine from Vite env. MockScanner stays the default so the
+// app and Demo Mode work with no backend running; set VITE_USE_REAL_BACKEND=true
+// (and optionally VITE_CLOAK_API_URL) to route scans to the FastAPI backend.
+const env = (import.meta as { env?: Record<string, string> }).env ?? {}
+const useReal = String(env.VITE_USE_REAL_BACKEND ?? '').toLowerCase() === 'true'
+export const activeScanner: ScannerEngine = useReal
+  ? new RealScanner(env.VITE_CLOAK_API_URL)
+  : scanner
+
+/**
+ * Convenience wrapper used by hooks/components.
+ *
+ * Delegates to the engine chosen above (Mock by default, Real when
+ * VITE_USE_REAL_BACKEND=true). Existing imports of `scanImage` from
+ * './mockScanner' continue to work unchanged.
+ */
 export function scanImage(input: ScanImageInput): Promise<ScanResult> {
-  return scanner.scanImage(input)
+  return activeScanner.scanImage(input)
 }

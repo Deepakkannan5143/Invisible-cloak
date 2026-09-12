@@ -30,6 +30,14 @@ npm run build    # type-check + production build
 npm run preview  # preview the production build
 ```
 
+## Backend engine (optional)
+
+A real detection & redaction service lives in [`backend/`](backend/README.md) —
+a FastAPI implementation of the **DETECT → LOCATE → PROTECT → VERIFY** pipeline
+(regex + Luhn/Verhoeff validation, OCR-token merging, IoU bbox union, adaptive
+Pillow obfuscation). The frontend uses the in-browser mock by default; set
+`VITE_USE_REAL_BACKEND=true` (see `.env.example`) to route scans to it.
+
 ## How It Works
 
 The frontend works entirely without a backend via a **mock scanning engine**.
