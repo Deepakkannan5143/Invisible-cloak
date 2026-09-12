@@ -14,6 +14,7 @@ from ..schemas import (
     Summary,
 )
 from ..logging_util import debug, info, mask_for_log
+from .context import REDACT_THRESHOLD
 from .detectors import SEVERITY_BY_TYPE, detect_text
 from .locate import Box, LocatedDetection, Token, locate
 from .ocr import extract_tokens, ocr_crop_text, ocr_unavailable_reason
@@ -107,6 +108,25 @@ def run_pipeline(req: ScanRequest) -> ScanResponse:
             detections = _locate_tokens(tokens, enabled, img_w, img_h)
     else:
         detections = _detect_from_text(req, enabled)
+
+    # ---- THRESHOLD: only redact candidates the model is confident about ---
+    # Context-aware scoring means a bare 12-digit "Order Number" scores low and
+    # is dropped here rather than blindly redacted. Confidence is 0..1; the
+    # threshold is 0..100.
+    kept: list[LocatedDetection] = []
+    for det in detections:
+        if det.confidence * 100.0 >= REDACT_THRESHOLD:
+            kept.append(det)
+            debug(
+                "keep %s conf=%.0f signals=%s",
+                det.type, det.confidence * 100.0, list(det.signals),
+            )
+        else:
+            debug(
+                "drop %s conf=%.0f (below threshold) signals=%s",
+                det.type, det.confidence * 100.0, list(det.signals),
+            )
+    detections = kept
 
     # ---- PROTECT (+ VERIFY with escalation) -------------------------------
     # Real re-OCR verifier: verify_region crops the (now-masked) region and
