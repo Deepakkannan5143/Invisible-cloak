@@ -91,7 +91,10 @@ export const SEVERITY_COLOR: Record<Severity, string> = {
 export const DEFAULT_ENABLED: SensitiveType[] = [
   'AADHAAR',
   'CREDIT_CARD',
+  'DEBIT_CARD',
   'API_KEY',
+  'ACCESS_TOKEN',
+  'JWT_TOKEN',
   'PASSWORD',
   'EMAIL',
   'PHONE',
