@@ -7,7 +7,7 @@ import {
 } from 'react'
 import { AnimatePresence, motion } from 'framer-motion'
 import { Play } from 'lucide-react'
-import type { ProtectionMode, SensitiveType } from '../types/scanner'
+import type { ProtectionMode, SensitiveRegion, SensitiveType } from '../types/scanner'
 import { DEFAULT_ENABLED } from '../lib/typeMeta'
 import { downloadDataUrl, dataUrlToBlob } from '../lib/imageProcessor'
 import { generateSampleScreenshot } from '../lib/sampleScreenshot'
@@ -52,9 +52,9 @@ const ProtectFlow = forwardRef<ProtectFlowHandle, Props>(function ProtectFlow(
   }, [state.phase, state.progress, onPhaseChange])
 
   const startScan = useCallback(
-    (src: string) => {
+    (src: string, regions?: SensitiveRegion[]) => {
       const enabledTypes = [...enabled]
-      run(src, { enabledTypes, mode, reducedMotion: reduced }).catch(() => {
+      run(src, { enabledTypes, mode, reducedMotion: reduced, regions }).catch(() => {
         push({ kind: 'error', title: 'Scan failed', description: 'Please try another image.' })
       })
     },
@@ -71,12 +71,14 @@ const ProtectFlow = forwardRef<ProtectFlowHandle, Props>(function ProtectFlow(
 
   const runDemo = useCallback(() => {
     const sample = generateSampleScreenshot()
-    if (!sample) {
+    if (!sample.src) {
       push({ kind: 'error', title: 'Demo unavailable', description: 'Canvas not supported.' })
       return
     }
     push({ kind: 'info', title: 'Demo started', description: 'Loading a sample screenshot…' })
-    startScan(sample)
+    // The demo generator knows the exact location of every sensitive value, so
+    // pass those regions through — redaction then aligns perfectly.
+    startScan(sample.src, sample.regions)
   }, [push, startScan])
 
   // expose runDemo to parent

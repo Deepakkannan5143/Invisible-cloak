@@ -58,13 +58,16 @@ function paintRegion(
   ctx.clip()
 
   if (mode === 'redact') {
-    ctx.fillStyle = '#111827'
+    // Even "redact" keeps the pixels underneath (a strong blur) rather than a
+    // flat fill, then lays a translucent dark strip so nothing is readable.
+    blurRegion(ctx, img, W, H, 12)
+    ctx.fillStyle = 'rgba(17,24,39,0.82)'
     ctx.fillRect(x, y, w, h)
   } else if (mode === 'pixelate') {
-    pixelate(ctx, img, x, y, w, h, W, H)
+    pixelate(ctx, img, x, y, w, h)
   } else {
-    // blur & frosted both use a blurred draw; frosted adds a light glass tint
-    blurRegion(ctx, img, x, y, w, h, W, H, mode === 'frosted' ? 10 : 8)
+    // blur & frosted both use a strong blurred draw; frosted adds a glass tint.
+    blurRegion(ctx, img, W, H, mode === 'frosted' ? 14 : 12)
     if (mode === 'frosted') {
       ctx.fillStyle = 'rgba(255,255,255,0.35)'
       ctx.fillRect(x, y, w, h)
@@ -100,22 +103,16 @@ function roundRect(
 function blurRegion(
   ctx: CanvasRenderingContext2D,
   img: HTMLImageElement,
-  x: number,
-  y: number,
-  w: number,
-  h: number,
   W: number,
   H: number,
   amount: number,
 ) {
-  // draw a scaled-down then scaled-up copy for a cheap blur, plus canvas filter
+  // The caller has already clipped to the region, so redrawing the whole
+  // (blurred) image only paints inside that region. A strong radius guarantees
+  // the underlying characters are unreadable.
   ctx.filter = `blur(${amount}px)`
   ctx.drawImage(img, 0, 0, W, H)
   ctx.filter = 'none'
-  void x
-  void y
-  void w
-  void h
 }
 
 function pixelate(
@@ -125,21 +122,19 @@ function pixelate(
   y: number,
   w: number,
   h: number,
-  W: number,
-  H: number,
 ) {
-  const blocks = 10
+  // Downscale the region to a handful of blocks, then upscale with smoothing
+  // off — a heavy mosaic that destroys legibility.
+  const blocks = 8
   const tmp = document.createElement('canvas')
   tmp.width = Math.max(1, blocks)
-  tmp.height = Math.max(1, Math.round((blocks * h) / w))
+  tmp.height = Math.max(1, Math.round((blocks * h) / Math.max(1, w)))
   const tctx = tmp.getContext('2d')
   if (!tctx) return
   tctx.drawImage(img, x, y, w, h, 0, 0, tmp.width, tmp.height)
   ctx.imageSmoothingEnabled = false
   ctx.drawImage(tmp, 0, 0, tmp.width, tmp.height, x, y, w, h)
   ctx.imageSmoothingEnabled = true
-  void W
-  void H
 }
 
 /**

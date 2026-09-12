@@ -98,18 +98,32 @@ export default function DetectionOverlay({
 function RedactionRegion({ active, mode }: { active: boolean; mode: ProtectionMode }) {
   if (!active) return null
 
+  // Each mode obscures the pixels *behind* the overlay (the screenshot value)
+  // using backdrop-filter, so the real value stays in the image but is
+  // unreadable. A strong blur radius is used so characters cannot be recovered.
   const base = 'absolute inset-0 rounded-md overflow-hidden'
   if (mode === 'redact') {
-    return <div className={`${base} redaction-strip`} />
+    return (
+      <div
+        className={base}
+        style={{
+          backdropFilter: 'blur(9px)',
+          WebkitBackdropFilter: 'blur(9px)',
+          background: 'rgba(17,24,39,0.82)',
+        }}
+      />
+    )
   }
   if (mode === 'pixelate') {
     return (
       <div
         className={base}
         style={{
+          backdropFilter: 'blur(6px) contrast(0.85)',
+          WebkitBackdropFilter: 'blur(6px) contrast(0.85)',
           backgroundImage:
-            'repeating-conic-gradient(rgba(148,163,184,0.9) 0% 25%, rgba(203,213,225,0.9) 0% 50%)',
-          backgroundSize: '8px 8px',
+            'repeating-conic-gradient(rgba(148,163,184,0.55) 0% 25%, rgba(203,213,225,0.55) 0% 50%)',
+          backgroundSize: '9px 9px',
         }}
       />
     )
@@ -119,9 +133,9 @@ function RedactionRegion({ active, mode }: { active: boolean; mode: ProtectionMo
       <div
         className={base}
         style={{
-          background: 'rgba(255,255,255,0.55)',
-          backdropFilter: 'blur(6px)',
-          WebkitBackdropFilter: 'blur(6px)',
+          background: 'rgba(255,255,255,0.5)',
+          backdropFilter: 'blur(10px) saturate(1.1)',
+          WebkitBackdropFilter: 'blur(10px) saturate(1.1)',
           border: '1px solid rgba(255,255,255,0.7)',
         }}
       />
@@ -132,9 +146,9 @@ function RedactionRegion({ active, mode }: { active: boolean; mode: ProtectionMo
     <div
       className={base}
       style={{
-        backdropFilter: 'blur(7px)',
-        WebkitBackdropFilter: 'blur(7px)',
-        background: 'rgba(226,232,240,0.35)',
+        backdropFilter: 'blur(10px)',
+        WebkitBackdropFilter: 'blur(10px)',
+        background: 'rgba(226,232,240,0.28)',
       }}
     />
   )
