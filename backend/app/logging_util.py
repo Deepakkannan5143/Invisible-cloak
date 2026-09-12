@@ -33,6 +33,20 @@ def mask_for_log(value: str, keep: int = 2) -> str:
     return f"{s[:keep]}{'•' * (len(s) - keep * 2)}{s[-keep:]}"
 
 
+def mask_candidate(value: str, keep: int = 4) -> str:
+    """Mask a sensitive candidate for diagnostics, e.g. ``4111********1111``.
+
+    Keeps the first/last ``keep`` characters and stars the middle. For short
+    values it fully stars them. Never returns the full value.
+    """
+    if value is None:
+        return "<none>"
+    s = str(value)
+    if len(s) <= keep * 2:
+        return "*" * len(s)
+    return f"{s[:keep]}{'*' * (len(s) - keep * 2)}{s[-keep:]}"
+
+
 def debug(msg: str, *args: object) -> None:
     """Log at DEBUG only when CLOAK_DEBUG is enabled."""
     if DEBUG:
