@@ -25,3 +25,15 @@ dist-ssr
 
 # TS build info
 *.tsbuildinfo
+
+
+# Python backend
+backend/.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.python-version
+
+# Env
+.env
+.env.local
