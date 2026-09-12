@@ -212,15 +212,19 @@ def _is_numeric_token(text: str) -> bool:
 
 
 def _is_card_group_token(text: str) -> bool:
-    """A token shaped like a card/Aadhaar group: exactly 3-4 digits, no '/'.
+    """A token shaped like a card/Aadhaar digit group, no separators.
 
-    Excludes date fragments (``09/29``) and stray short numbers so cross-line
-    reconstruction only ever stitches genuine card/Aadhaar groups together.
+    Accepts 3-8 contiguous digits: a single 4-digit group (``4111``), an
+    OCR-merged pair of groups (``41111111`` — Tesseract commonly joins two
+    groups), or a 3-digit fragment. Excludes date fragments (``09/29``) and
+    over-long / non-numeric tokens. Cross-line reconstruction stays safe
+    because the concatenated candidate must still pass its checksum (Luhn /
+    Verhoeff) downstream before it is accepted.
     """
-    if "/" in text:
-        return False
     core = text.strip()
-    return core.isdigit() and 3 <= len(core) <= 4
+    if not core.isdigit():
+        return False
+    return 3 <= len(core) <= 8
 
 
 def _reconstruct_cross_line(

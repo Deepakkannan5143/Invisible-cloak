@@ -49,6 +49,11 @@ def mask_value(dtype: str, raw: str) -> str:
         return "-----BEGIN PRIVATE KEY----- ••••"
     if dtype == "PASSWORD":
         return "•" * min(12, max(8, len(raw)))
+    if dtype == "CVV":
+        # Never reveal any CVV digit.
+        return "•" * max(3, len(digits) or 3)
+    if dtype == "CARD_EXPIRY":
+        return "••/••"
     if dtype in ("IP_ADDRESS", "MAC_ADDRESS"):
         return "•••.•••.•.•"
     if dtype == "PAN":
