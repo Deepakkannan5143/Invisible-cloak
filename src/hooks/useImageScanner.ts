@@ -64,6 +64,8 @@ interface RunOptions {
   reducedMotion: boolean
   /** Optional exact regions (demo generator / real vision backend). */
   regions?: SensitiveRegion[]
+  /** User-defined custom patterns (Protection Settings). */
+  customPatterns?: string[]
 }
 
 export function useImageScanner() {
@@ -107,6 +109,7 @@ export function useImageScanner() {
         height: dims.height,
         enabledTypes: opts.enabledTypes,
         regions: opts.regions,
+        customPatterns: opts.customPatterns,
       })
 
       const scanDuration = opts.reducedMotion ? 600 : 2600

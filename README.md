@@ -40,6 +40,15 @@ extracts sensitive data from uploaded images server-side — the frontend never
 runs OCR. The frontend uses the in-browser mock by default; set
 `VITE_USE_REAL_BACKEND=true` (see `.env.example`) to route scans to it.
 
+It detects and redacts exactly the eight categories exposed in the frontend
+**Protection Settings** — **Aadhaar, Credit Card, API Key, Password, Email,
+Phone Number, Address, Custom Pattern** — each toggled independently via the
+request's `enabled_types` (only enabled categories are detected). Every
+category is detected by a multi-signal pipeline (structure + checksum/validation
++ spatially-local context + OCR-token reconstruction), not by keyword or regex
+alone. See the [backend README](backend/README.md#supported-detection-types) for
+the full type mapping, `enabled_types` control, and `custom_patterns` usage.
+
 ## How It Works
 
 The frontend works entirely without a backend via a **mock scanning engine**.

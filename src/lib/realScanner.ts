@@ -52,6 +52,9 @@ export interface OcrToken {
 
 /** Maps a backend type string onto a frontend SensitiveType. */
 function toSensitiveType(t: string): SensitiveType {
+  // The backend's canonical custom type is CUSTOM_PATTERN; the UI toggle is
+  // CUSTOM. Normalize it (and a couple of near-synonyms) before the lookup.
+  if (t === 'CUSTOM_PATTERN') return 'CUSTOM'
   const known: SensitiveType[] = [
     'AADHAAR', 'CREDIT_CARD', 'DEBIT_CARD', 'API_KEY', 'PASSWORD', 'EMAIL',
     'PHONE', 'IP_ADDRESS', 'JWT_TOKEN', 'ACCESS_TOKEN', 'EMPLOYEE_ID',
@@ -87,12 +90,22 @@ export class RealScanner implements ScannerEngine {
 
   async scanImage(input: ScanImageInput, extra?: RealScanOptions): Promise<ScanResult> {
     const enabledTypes = input.enabledTypes.map(String)
+    // The UI's CUSTOM toggle maps to the backend's canonical CUSTOM_PATTERN
+    // type; send both so either name enables user regexes on the backend.
+    if (enabledTypes.includes('CUSTOM') && !enabledTypes.includes('CUSTOM_PATTERN')) {
+      enabledTypes.push('CUSTOM_PATTERN')
+    }
     const body: Record<string, unknown> = {
       mode: 'frosted',
       enabled_types: enabledTypes,
       image_base64: input.src,
       image_width: input.width,
       image_height: input.height,
+    }
+    // Forward user-defined custom patterns (labels or regexes). The backend
+    // validates/compiles them safely and only runs them when CUSTOM is enabled.
+    if (input.customPatterns && input.customPatterns.length > 0) {
+      body.custom_patterns = input.customPatterns.map((p) => ({ name: p }))
     }
     if (extra?.tokens) body.tokens = extra.tokens
     if (extra?.text) body.text = extra.text

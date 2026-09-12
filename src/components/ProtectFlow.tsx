@@ -54,11 +54,11 @@ const ProtectFlow = forwardRef<ProtectFlowHandle, Props>(function ProtectFlow(
   const startScan = useCallback(
     (src: string, regions?: SensitiveRegion[]) => {
       const enabledTypes = [...enabled]
-      run(src, { enabledTypes, mode, reducedMotion: reduced, regions }).catch(() => {
+      run(src, { enabledTypes, mode, reducedMotion: reduced, regions, customPatterns }).catch(() => {
         push({ kind: 'error', title: 'Scan failed', description: 'Please try another image.' })
       })
     },
-    [enabled, mode, reduced, run, push],
+    [enabled, mode, reduced, run, push, customPatterns],
   )
 
   const handleImage = useCallback(

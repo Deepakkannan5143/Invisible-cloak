@@ -125,6 +125,13 @@ CONTEXT: dict[str, ContextTiers] = {
                           ("phone", "mobile", "tel", "call", "contact"), _WEAK_GENERIC),
     "IP_ADDRESS": ContextTiers(_NET_STRONG, _NET_MEDIUM, ()),
     "MAC_ADDRESS": ContextTiers(("mac address",), ("mac", "hardware", "network"), ()),
+    "ADDRESS": ContextTiers(
+        ("address", "home address", "residential address", "permanent address",
+         "office address", "billing address", "shipping address", "postal address"),
+        ("street", "road", "lane", "avenue", "apartment", "flat", "building",
+         "block", "district", "nagar", "colony", "sector"),
+        _WEAK_GENERIC,
+    ),
 }
 
 # ---------------------------------------------------------------------------
@@ -170,6 +177,173 @@ def find_keywords(window: str, keywords: tuple[str, ...]) -> list[str]:
 
 def negative_hits(window: str) -> list[str]:
     return find_keywords(window, NEGATIVE_CONTEXT)
+
+
+# ---------------------------------------------------------------------------
+# ADDRESS scoring (§11). An address is not a single-token pattern — it is a
+# *block* of text that must exhibit several independent geographic signals.
+# Rather than a brittle regex that flags any sentence containing "road", we
+# require a combination: an address label and/or street term, plus a
+# corroborating signal (house/building number, PIN/postal code, city/state).
+# This keeps unrelated prose ("...drove down the road...") from being flagged.
+# ---------------------------------------------------------------------------
+
+# Street / thoroughfare terms.
+_ADDR_STREET = (
+    "street", "st.", "road", "rd.", "lane", "ln.", "avenue", "ave", "boulevard",
+    "blvd", "drive", "marg", "cross", "main road", "highway", "bypass",
+)
+# Building / unit terms.
+_ADDR_UNIT = (
+    "apartment", "apartments", "apt", "flat", "building", "block", "tower",
+    "villa", "plot", "house no", "door no", "floor", "suite", "unit", "no.",
+)
+# Locality / administrative terms (generic, plus common Indian locality words).
+_ADDR_LOCALITY = (
+    "district", "city", "state", "country", "nagar", "colony", "layout",
+    "sector", "phase", "extension", "puram", "pura", "ganj", "vihar", "enclave",
+    "hills", "park", "market", "town", "village", "taluk", "mandal",
+)
+# Explicit address labels.
+_ADDR_LABEL = (
+    "address", "home address", "residential address", "permanent address",
+    "office address", "billing address", "shipping address", "postal address",
+    "correspondence address",
+)
+# Postal / PIN code terms.
+_ADDR_POSTAL = ("pincode", "pin code", "postal code", "zip code", "zip", "pin")
+
+# A handful of Indian state/UT names that strongly indicate a real address
+# block (kept small and deterministic; not an exhaustive gazetteer).
+_ADDR_STATES = (
+    "tamil nadu", "kerala", "karnataka", "andhra pradesh", "telangana",
+    "maharashtra", "gujarat", "rajasthan", "punjab", "haryana", "delhi",
+    "west bengal", "uttar pradesh", "madhya pradesh", "bihar", "odisha",
+    "assam", "goa", "chandigarh", "jharkhand", "chhattisgarh", "uttarakhand",
+    "himachal pradesh", "jammu", "kashmir",
+)
+
+# Point weights for the address block model.
+_ADDR_W_LABEL = 34
+_ADDR_W_STREET = 22
+_ADDR_W_UNIT = 16
+_ADDR_W_LOCALITY = 14
+_ADDR_W_STATE = 20
+_ADDR_W_PINCODE = 26          # a 6-digit Indian PIN inside the block
+_ADDR_W_HOUSE_NUMBER = 12     # a leading house/plot number
+_ADDR_W_MULTILINE = 8         # spans more than one line
+
+
+@dataclass
+class AddressScore:
+    confidence: float          # 0..1
+    score: float               # 0..100
+    signals: list[str] = field(default_factory=list)
+
+
+def _has_pincode(block: str) -> bool:
+    # Indian PIN is 6 digits (optionally split "600 040"); accept a 5-6 digit
+    # postal-code-shaped run that is NOT part of a longer number. A phone
+    # number (10+ digits, optional +CC) contains 6-digit substrings, so we
+    # first strip separators and reject blocks whose largest pure-digit run is
+    # phone-length (7+), which would otherwise masquerade as a PIN.
+    import re as _re
+    # If the block contains a long contiguous numeric identifier (phone / card
+    # / Aadhaar), that number is not a postal code.
+    for run in _re.findall(r"\d[\d ]*\d", block):
+        if sum(c.isdigit() for c in run) >= 7 and " " not in run.strip():
+            return False
+        # "+91 98765 43210" -> collapsed 12 digits: also phone-like.
+        if sum(c.isdigit() for c in run) >= 10:
+            return False
+    return bool(_re.search(r"(?<!\d)\d{3}\s?\d{3}(?!\d)", block)) or bool(
+        _re.search(r"(?<!\d)\d{5,6}(?!\d)", block)
+    )
+
+
+def _has_house_number(block: str) -> bool:
+    import re as _re
+    # A leading number or "12,", "Flat 302", "No. 45", "12/3" at a line start.
+    for line in block.splitlines():
+        s = line.strip()
+        if _re.match(r"^(?:flat|plot|door|house|no\.?|#)?\s*#?\d{1,4}[a-zA-Z]?\s*[,/\-]", s, _re.I):
+            return True
+        if _re.match(r"^\d{1,4}[a-zA-Z]?\s*,", s):
+            return True
+    return False
+
+
+def score_address(block: str, *, multiline: bool = False) -> AddressScore:
+    """Score a candidate address *block* on multiple independent signals.
+
+    ``block`` is the reconstructed text of one or more nearby lines. The score
+    combines an address label, street/unit/locality terms, an Indian
+    state/PIN, and a leading house number. A single lone signal (e.g. just the
+    word "road") is deliberately insufficient to cross the redaction floor.
+    """
+    norm = _normalize(block)
+    signals: list[str] = []
+    score = 0.0
+    cues = 0
+
+    label = [k for k in _ADDR_LABEL if k in norm]
+    if label:
+        score += _ADDR_W_LABEL
+        cues += 1
+        signals.append(f"address label: {label[0]}")
+
+    street = [k for k in _ADDR_STREET if k in norm]
+    if street:
+        score += _ADDR_W_STREET
+        cues += 1
+        signals.append(f"street term: {street[0]}")
+
+    unit = [k for k in _ADDR_UNIT if k in norm]
+    if unit:
+        score += _ADDR_W_UNIT
+        cues += 1
+        signals.append(f"building/unit term: {unit[0]}")
+
+    locality = [k for k in _ADDR_LOCALITY if k in norm]
+    if locality:
+        score += _ADDR_W_LOCALITY
+        cues += 1
+        signals.append(f"locality term: {locality[0]}")
+
+    state = [k for k in _ADDR_STATES if k in norm]
+    if state:
+        score += _ADDR_W_STATE
+        cues += 1
+        signals.append("state/region name present")
+
+    postal_label = [k for k in _ADDR_POSTAL if k in norm]
+    if _has_pincode(block):
+        score += _ADDR_W_PINCODE
+        cues += 1
+        signals.append("postal/PIN code present")
+    elif postal_label:
+        score += _ADDR_W_LOCALITY
+        cues += 1
+        signals.append(f"postal term: {postal_label[0]}")
+
+    if _has_house_number(block):
+        score += _ADDR_W_HOUSE_NUMBER
+        signals.append("house/plot number present")
+
+    if multiline:
+        score += _ADDR_W_MULTILINE
+        signals.append("multi-line address block")
+
+    # Corroboration: require at least two independent geographic cues so a lone
+    # keyword can never redact. One cue alone is capped well below threshold.
+    if cues >= 2:
+        signals.append(f"{cues} corroborating address cues")
+    else:
+        score = min(score, 30.0)
+
+    score = max(0.0, min(100.0, score))
+    return AddressScore(confidence=round(score / 100.0, 4),
+                        score=round(score, 1), signals=signals)
 
 
 def score_candidate(
