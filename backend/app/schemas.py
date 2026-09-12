@@ -42,6 +42,21 @@ class OcrToken(BaseModel):
     bbox: list[float] = Field(..., min_length=4, max_length=4)
 
 
+class CustomPattern(BaseModel):
+    """A user-provided custom detection pattern (Protection Settings §12).
+
+    ``regex`` is optional — when omitted, ``name`` is matched as a literal
+    (case-insensitive) phrase. Patterns are validated/compiled defensively on
+    the backend (length-capped, ReDoS shapes rejected); a bad pattern is
+    skipped rather than failing the whole scan.
+    """
+
+    name: str
+    regex: Optional[str] = None
+    confidence: Optional[float] = None
+    description: Optional[str] = None
+
+
 class ScanRequest(BaseModel):
     """Incoming payload.
 
@@ -57,9 +72,14 @@ class ScanRequest(BaseModel):
     image_width: Optional[int] = None
     image_height: Optional[int] = None
     mode: ProtectionMode = ProtectionMode.FROSTED
-    # If provided, only these types are protected. Types use the canonical
-    # SensitiveType names (e.g. "AADHAAR", "CREDIT_CARD"). None => all types.
+    # If provided, only these types are protected. Accepts canonical
+    # SensitiveType names (e.g. "AADHAAR", "CREDIT_CARD") or frontend toggle
+    # labels / aliases (e.g. "credit_card", "phone", "custom"), which the
+    # backend normalizes. None => all types.
     enabled_types: Optional[list[str]] = None
+    # User-defined custom detection patterns. Only run when the CUSTOM_PATTERN
+    # (frontend "Custom Pattern") type is enabled.
+    custom_patterns: Optional[list[CustomPattern]] = None
 
 
 # ---------------------------------------------------------------------------

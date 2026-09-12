@@ -63,6 +63,10 @@ def mask_value(dtype: str, raw: str) -> str:
     if dtype == "ADDRESS":
         first = raw.split(",")[0].split(" ")[0] if raw else "•••"
         return first + " •••••••, •••"
+    if dtype == "CUSTOM_PATTERN":
+        # Preserve only the length shape; reveal nothing of a user-defined value.
+        n = len(raw.strip())
+        return "•" * min(16, max(4, n))
     return "[REDACTED]"
 
 

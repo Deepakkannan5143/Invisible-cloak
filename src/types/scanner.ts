@@ -73,6 +73,12 @@ export interface ScanImageInput {
    * instead of heuristic templates, guaranteeing every value is covered.
    */
   regions?: SensitiveRegion[]
+  /**
+   * User-defined custom patterns from Protection Settings. Each entry is a
+   * label or regex; forwarded to the backend as `custom_patterns` and only
+   * used when the CUSTOM type is enabled.
+   */
+  customPatterns?: string[]
 }
 
 /** The contract any scanner (mock or real) must fulfil. */

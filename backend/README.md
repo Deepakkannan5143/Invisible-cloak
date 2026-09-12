@@ -12,9 +12,9 @@ JSON contract. The frontend never has to run OCR.
 
 | Stage | Module | What it does |
 |-------|--------|--------------|
-| **OCR** | `app/pipeline/ocr.py` | Runs Tesseract via `pytesseract.image_to_data` when an image is supplied and no tokens were given. Emits tokens with `text`, pixel `bbox [x,y,w,h]` and `confidence`. Degrades gracefully to no-op if the binary is missing. |
+| **OCR** | `app/pipeline/ocr.py` | Runs Tesseract via `pytesseract.image_to_data` when an image is supplied and no tokens were given. Emits tokens with `text`, pixel `bbox [x,y,w,h]` and `confidence`. A second **upscaled + grayscale preprocessing pass** recovers small / high-entropy tokens (API keys, tokens) the base pass reads with low confidence; extra tokens are rescaled to the base coordinate space and de-duplicated by bbox coverage. Credential-prefixed tokens (`sk-`, `ghp_`, `AKIA`, `eyJ`…) are kept even at low OCR confidence, because the prefix is strong intrinsic evidence. Degrades gracefully to no-op if the binary is missing. |
 | **DETECT** | `app/pipeline/detectors.py`, `validators.py`, `context.py` | Regex pattern library + **Luhn**/**Verhoeff**/IPv4 validation, feeding a **context-aware confidence model** (see below): candidates are scored on intrinsic evidence *and* surrounding keywords, with negative-context suppression and a redaction threshold. |
-| **LOCATE** | `app/pipeline/locate.py` | Groups OCR tokens into lines, merges horizontally adjacent tokens (e.g. `7730 \| 0889 \| 2163` → one candidate), **reconstructs numbers split across stacked lines**, pulls in **label text from nearby lines as spatial context** (LABEL-above-VALUE layouts), unions contributing boxes into ONE bbox, and pads it 10–15% of text height. |
+| **LOCATE** | `app/pipeline/locate.py` | Groups OCR tokens into lines, merges horizontally adjacent tokens (e.g. `7730 \| 0889 \| 2163` → one candidate), **reconstructs numbers split across stacked lines**, **groups consecutive lines into a single multi-line address block**, pulls in **label text from nearby lines as spatial context** (LABEL-above-VALUE layouts), unions contributing boxes into ONE bbox, and pads it 10–15% of text height. |
 
 ### Context-aware detection (`context.py`)
 
@@ -75,6 +75,8 @@ Optional env overrides:
 - `TESSERACT_CMD` — full path to the `tesseract` binary if not on `PATH`.
 - `TESSDATA_PREFIX` — path to the `tessdata` language directory (for non-standard installs).
 - `CLOAK_OCR_MIN_CONF` — minimum per-token OCR confidence to keep (default `30`).
+- `CLOAK_OCR_PREPROCESS` — run the second upscaled/grayscale OCR pass (default `true`; set `false` for a single fastest pass).
+- `CLOAK_OCR_UPSCALE` — upscale factor for the preprocessing pass (default `2.0`).
 
 Verify it is reachable: `GET /health` returns `"ocr_available": true`.
 
@@ -100,9 +102,14 @@ Request (any combination of `text`, `tokens`, `image_base64`):
   "image_width": 400,
   "image_height": 200,
   "mode": "frosted",
-  "enabled_types": ["AADHAAR", "CREDIT_CARD"]
+  "enabled_types": ["aadhaar", "credit_card", "email", "phone", "address", "custom"],
+  "custom_patterns": [{ "name": "Employee ID", "regex": "EMP-[0-9]{6}" }]
 }
 ```
+
+`enabled_types` accepts the frontend toggle labels / aliases (normalized to
+canonical types) or the canonical names directly. See
+[Controlling detection with `enabled_types`](#controlling-detection-with-enabled_types).
 
 Response (strict contract):
 
@@ -138,12 +145,85 @@ Response (strict contract):
 
 `GET /health` → `{"status": "ok", "version": "1.0.0", "ocr_available": true}`.
 
-## Detected categories
+## Supported detection types
 
-National IDs (Aadhaar, PAN, SSN, Passport, UK NINO, KR RRN), payment cards
-(Luhn-validated), IBAN / SWIFT / IFSC / UPI / crypto wallets, API keys (OpenAI
-`sk-`, AWS `AKIA`, GitHub `ghp_`), JWTs, private keys, passwords, emails, phones,
-IPv4, MAC addresses. See `PATTERNS` in `app/pipeline/detectors.py`.
+The frontend **Protection Settings** panel exposes exactly eight toggleable
+detection layers. Each maps to a canonical backend `SensitiveType` and is only
+run when it is present in the request's `enabled_types` (see below):
+
+| Frontend toggle | `enabled_types` value(s) accepted | Canonical type | How it's detected |
+|-----------------|-----------------------------------|----------------|-------------------|
+| **Aadhaar** | `aadhaar`, `aadhar`, `uid`, `AADHAAR` | `AADHAAR` | 12-digit structure + **Verhoeff** checksum + Aadhaar context. |
+| **Credit Card** | `credit_card`, `credit card`, `card`, `CREDIT_CARD` | `CREDIT_CARD` (+`DEBIT_CARD`) | 13–19-digit structure + **Luhn** checksum + payment context. |
+| **API Key** | `api_key`, `api key`, `apikey`, `API_KEY` | `API_KEY` | Provider prefixes (`sk-`, `AKIA`, `ghp_`, `eyJ`…), charset/length, entropy, credential context. |
+| **Password** | `password`, `passwd`, `pwd`, `PASSWORD` | `PASSWORD` | Label-anchored **value** capture (`Password: …`) — the secret, not the word. |
+| **Email** | `email`, `e-mail`, `mail`, `EMAIL` | `EMAIL` | RFC-ish email syntax; works with or without a label. |
+| **Phone Number** | `phone`, `phone_number`, `mobile`, `PHONE` | `PHONE` | E.164 / Indian groupings + digit-count + context; random numbers need more evidence. |
+| **Address** | `address`, `home_address`, `ADDRESS` | `ADDRESS` | **Multi-signal block**: address label + street/unit/locality/state + PIN/postal + house number, grouped across lines. A lone "road"/"city" is not an address. |
+| **Custom Pattern** | `custom`, `custom_pattern`, `CUSTOM` | `CUSTOM_PATTERN` | User-supplied regex/label from `custom_patterns` (validated & ReDoS-guarded). |
+
+Detection **never depends on labels alone**: a bare, checksum-valid Aadhaar or
+Luhn-valid card is still detected without a label, and a label alone (`"Email"`,
+`"Credit Card"`, `"Address"`) is never treated as the sensitive value. Context
+strengthens confidence but is spatially local — a keyword at the top of an image
+does not classify an unrelated number at the bottom.
+
+> The backend also ships additional detectors used internally / by the API
+> (PAN, SSN, Passport, IBAN, SWIFT, IFSC, UPI, crypto wallets, JWT, private
+> keys, IPv4, MAC, CVV/expiry as card context). These only run when explicitly
+> enabled; the eight above are the frontend-exposed set. See `PATTERNS` in
+> `app/pipeline/detectors.py`.
+
+### Controlling detection with `enabled_types`
+
+`enabled_types` is the **authoritative list** of what to detect and redact:
+
+- **Omitted / `null`** → every detector runs.
+- **A list** → only those types run; disabled categories are neither detected
+  nor redacted, and their pixels are left untouched.
+- Values are **normalized**: the frontend toggle labels and common aliases
+  (`aadhar`→`AADHAAR`, `phone_number`→`PHONE`, `credit card`→`CREDIT_CARD`,
+  `custom`→`CUSTOM_PATTERN`) all resolve to the canonical type. Enabling
+  `credit_card` also protects `DEBIT_CARD` (one UI toggle, both card variants).
+
+```jsonc
+// Only Aadhaar runs — a credit card in the same image is left untouched.
+{ "image_base64": "…", "enabled_types": ["aadhaar"] }
+```
+
+### Custom patterns (`custom_patterns`)
+
+When **Custom Pattern** is enabled, user-defined patterns run against the OCR
+text and matches are located + redacted like any other type:
+
+```jsonc
+{
+  "image_base64": "…",
+  "enabled_types": ["custom"],
+  "custom_patterns": [
+    { "name": "Employee ID", "regex": "EMP-[0-9]{6}" },
+    { "name": "Project Falcon" }          // no regex → matched as a literal phrase
+  ]
+}
+```
+
+Each pattern accepts `name` (required), optional `regex`, `confidence`, and
+`description`. Patterns are **validated defensively**: the source is
+length-capped, catastrophic-backtracking (ReDoS) shapes are rejected, matching
+is character-budgeted, and a single bad pattern is skipped rather than failing
+the scan. No user input is ever `eval`'d — only `re.compile`'d.
+
+## Confidence, thresholds & privacy score
+
+Each detection carries a `0..1` `confidence` derived from the additive model
+above. `REDACT_THRESHOLD` (default 45/100) decides redact vs. skip. The
+`privacy_score` is honest about outcomes:
+
+- **100** only when no *enabled* sensitive data was detected.
+- **< 100** when data was detected and protected (residual risk by severity).
+- **Significantly reduced** — and never 100 — if a detection's protection
+  verification fails, or if an enabled detector crashes internally (the failure
+  is logged privacy-safely and reported, never hidden).
 
 ## Run
 

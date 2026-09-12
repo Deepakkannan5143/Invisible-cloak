@@ -64,7 +64,10 @@ def verify_region(
     """Return True if the region is considered adequately protected."""
     crop = _crop(protected_img, det.box)
 
-    if ocr_fn is not None:
+    # CUSTOM_PATTERN values are defined by a user regex that is not available to
+    # the re-OCR detector here, so a content re-scan can't judge them. Fall back
+    # to the structural check (pixels must have been substantially altered).
+    if ocr_fn is not None and det.type != "CUSTOM_PATTERN":
         recovered = ocr_fn(crop)
         # If detection finds nothing sensitive of this type in the re-OCR'd
         # text, the region passes verification.

@@ -15,7 +15,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .detectors import Match, detect_text
+from .context import score_address
+from .detectors import (
+    CustomPatternSpec,
+    Match,
+    detect_address_block,
+    detect_text,
+)
 
 
 @dataclass
@@ -154,7 +160,9 @@ def _spatial_context_prefix(line: list[Token], all_lines: list[list[Token]]) -> 
 
 def locate(tokens: list[Token], enabled_types: set[str] | None,
            img_w: float | None = None, img_h: float | None = None,
-           pad_ratio: float = 0.12) -> list[LocatedDetection]:
+           pad_ratio: float = 0.12,
+           custom_patterns: list[CustomPatternSpec] | None = None
+           ) -> list[LocatedDetection]:
     """Reconstruct lines, detect with spatial context, union boxes, and pad."""
     located: list[LocatedDetection] = []
     lines = group_into_lines(tokens)
@@ -181,10 +189,15 @@ def locate(tokens: list[Token], enabled_types: set[str] | None,
             spans.append((start, cursor))
         merged = prefix_str + "".join(parts)
 
-        for match in detect_text(merged, enabled_types):
+        for match in detect_text(merged, enabled_types, custom_patterns):
             # Ignore matches that fall entirely inside the context prefix
             # (that text belongs to a different line and is handled there).
             if match.end <= offset:
+                continue
+            # ADDRESS on a single line is handled by the multi-line
+            # reconstruction pass below (which unions the whole block); skip the
+            # per-line hit so we don't emit a partial single-line address box.
+            if match.type == "ADDRESS":
                 continue
             boxes = _tokens_for_span(line, spans, match)
             if not boxes:
@@ -202,6 +215,13 @@ def locate(tokens: list[Token], enabled_types: set[str] | None,
     located.extend(
         _reconstruct_cross_line(lines, enabled_types, img_w, img_h, pad_ratio)
     )
+
+    # Multi-line ADDRESS reconstruction: group consecutive lines into a block
+    # and score the block as a whole, unioning every contributing token box.
+    if enabled_types is None or "ADDRESS" in enabled_types:
+        located.extend(
+            _reconstruct_address(lines, img_w, img_h, pad_ratio)
+        )
 
     return _dedupe(located)
 
@@ -312,6 +332,97 @@ def _reconstruct_cross_line(
                     box=u, signals=match.signals + ("reconstructed across lines",),
                 )
             )
+    return out
+
+
+def _reconstruct_address(
+    lines: list[list[Token]],
+    img_w: float | None,
+    img_h: float | None,
+    pad_ratio: float,
+) -> list[LocatedDetection]:
+    """Group consecutive lines into address blocks and score each block.
+
+    Addresses commonly wrap across 2-4 lines::
+
+        Address:
+        12, Anna Nagar Main Road,
+        Chennai, Tamil Nadu - 600040
+
+    Starting at each line, we grow a window of vertically-close lines (up to a
+    small cap), score the accumulated block via the address model, and keep the
+    highest-scoring block that crosses the redaction floor. Every contributing
+    token box is unioned into ONE region so the whole block is redacted — not
+    just the PIN code or a single street word.
+    """
+    out: list[LocatedDetection] = []
+    if not lines:
+        return out
+
+    # Order lines top-to-bottom by their first token.
+    ordered = sorted(lines, key=lambda ln: min(t.box.y for t in ln))
+    n = len(ordered)
+    MAX_BLOCK_LINES = 5
+
+    def _line_has_address_cue(line: list[Token]) -> bool:
+        """A line worth *starting* a block from — it carries some address cue.
+
+        We won't anchor an address block on an unrelated line (e.g. a phone
+        line). A label line ("Home Address:"), a street/unit line, or a line
+        beginning with a house number is a valid anchor.
+        """
+        txt = " ".join(t.text for t in line)
+        # Score the single line; if it contributes any address signal it can
+        # anchor a block. (A lone weak cue won't cross the redact floor on its
+        # own, but it can start a block that accumulates enough evidence.)
+        s = score_address(txt)
+        return len(s.signals) > 0
+
+    used_line_ids: set[int] = set()
+    for i in range(n):
+        anchor = ordered[i]
+        if id(anchor) in used_line_ids:
+            continue
+        if not _line_has_address_cue(anchor):
+            continue
+        best: tuple[float, object, list[Box], list[int]] | None = None
+        block_texts: list[str] = []
+        block_boxes: list[Box] = []
+        block_ids: list[int] = []
+        prev_box: Box | None = None
+        for k in range(i, min(n, i + MAX_BLOCK_LINES)):
+            line = ordered[k]
+            if id(line) in used_line_ids:
+                break
+            lb = _line_box(line)
+            if prev_box is not None:
+                gap = lb.y - prev_box.y2
+                if gap > 1.8 * max(lb.h, 1.0):  # next line too far below
+                    break
+            block_texts.append(" ".join(t.text for t in line))
+            block_boxes = block_boxes + [t.box for t in line]
+            block_ids = block_ids + [id(line)]
+            prev_box = lb
+            multiline = (k > i)
+            block_str = "\n".join(block_texts)
+            match = detect_address_block(block_str, multiline=multiline)
+            # Prefer the highest-confidence block; on a tie prefer the LONGER
+            # block so the whole multi-line address is captured as one region.
+            if match is not None:
+                key = (match.confidence, len(block_ids))
+                if best is None or key > (best[0], len(best[3])):
+                    best = (match.confidence, match, list(block_boxes), list(block_ids))
+        if best is not None:
+            _conf, match, boxes, ids = best
+            u = pad_box(union_box(boxes), pad_ratio, img_w, img_h)
+            out.append(
+                LocatedDetection(
+                    type="ADDRESS", severity="medium",
+                    confidence=match.confidence, value=match.value,  # type: ignore[attr-defined]
+                    box=u, signals=match.signals,  # type: ignore[attr-defined]
+                )
+            )
+            used_line_ids.update(ids)
     return out
 
 

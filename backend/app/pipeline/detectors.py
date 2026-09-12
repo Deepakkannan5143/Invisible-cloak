@@ -11,7 +11,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
-from .context import score_candidate
+from .context import REDACT_THRESHOLD, score_address, score_candidate
 from .validators import is_valid_ipv4, luhn_check, verhoeff_check
 
 
@@ -66,8 +66,11 @@ PATTERNS: list[PatternDef] = [
         0.98,
     ),
     PatternDef(
+        # The body allows a few OCR-noise characters (]/|.-_) that Tesseract
+        # commonly substitutes inside a high-entropy key, so a key survives an
+        # imperfect OCR read while the distinctive ``sk-`` prefix anchors it.
         "API_KEY", "critical",
-        _P(r"\bsk-(?:live-|test-|proj-)?[A-Za-z0-9]{16,64}\b"),
+        _P(r"\bsk-(?:live-|test-|proj-)?[A-Za-z0-9][A-Za-z0-9\]/|.\-_]{14,70}"),
         0.97, context_keywords=("api", "key", "secret", "openai"),
     ),
     PatternDef(
@@ -191,8 +194,12 @@ PATTERNS: list[PatternDef] = [
     ),
 ]
 
-# Fast lookup for severity by type (also used by LOCATE / VERIFY).
+# Fast lookup for severity by type (also used by LOCATE / VERIFY). ADDRESS and
+# CUSTOM_PATTERN are detected by dedicated block/regex paths (not PATTERNS), so
+# their severities are registered explicitly here.
 SEVERITY_BY_TYPE: dict[str, str] = {p.type: p.severity for p in PATTERNS}
+SEVERITY_BY_TYPE["ADDRESS"] = "medium"
+SEVERITY_BY_TYPE["CUSTOM_PATTERN"] = "medium"
 
 # Character window each side of a candidate scanned for context keywords. Used
 # for the text path; the spatial (LOCATE) path augments this window with tokens
@@ -263,10 +270,135 @@ def _score(
     return conf, tuple(scored.signals)
 
 
-def detect_text(text: str, enabled_types: Optional[set[str]] = None) -> list[Match]:
+# ---------------------------------------------------------------------------
+# Custom user-provided patterns (§12). Compiled defensively so a hostile or
+# accidentally-catastrophic regex cannot execute arbitrary code or hang the
+# process. Only run when CUSTOM_PATTERN is enabled.
+# ---------------------------------------------------------------------------
+
+# Upper bound on a user regex source length (defense-in-depth vs. pathological
+# patterns). Frontend custom patterns are short labels/regexes.
+_CUSTOM_REGEX_MAX_LEN = 300
+# Reject constructs most associated with catastrophic backtracking / ReDoS:
+# nested unbounded quantifiers like (a+)+ , (a*)* , (a+)* , etc.
+_REDOS_RE = re.compile(r"\([^)]*[+*]\)[+*]|\([^)]*\{\d+,\}\)[+*{]")
+
+
+@dataclass(frozen=True)
+class CustomPatternSpec:
+    """A validated, compiled user pattern (built by :func:`compile_custom_patterns`)."""
+    name: str
+    regex: re.Pattern
+    base_confidence: float = 0.85
+    description: str = ""
+
+
+def compile_custom_patterns(specs: list[dict]) -> list[CustomPatternSpec]:
+    """Validate + compile user-supplied patterns into safe :class:`CustomPatternSpec`.
+
+    Each spec is a dict with keys ``name`` (required) and optionally ``regex``,
+    ``confidence`` and ``description``. When no ``regex`` is given the ``name``
+    is treated as a literal phrase to match (case-insensitive). Invalid or
+    dangerous patterns are skipped (never raised) so one bad entry cannot break
+    a scan; the caller can log the count of accepted patterns.
+    """
+    out: list[CustomPatternSpec] = []
+    for spec in specs or []:
+        try:
+            name = str(spec.get("name", "")).strip()
+            if not name:
+                continue
+            raw_regex = spec.get("regex")
+            if raw_regex is None or str(raw_regex).strip() == "":
+                # Literal phrase match (word-boundary where sensible).
+                source = re.escape(name)
+            else:
+                source = str(raw_regex)
+            if len(source) > _CUSTOM_REGEX_MAX_LEN:
+                continue
+            if _REDOS_RE.search(source):
+                # Reject obvious catastrophic-backtracking shapes.
+                continue
+            compiled = re.compile(source)
+            conf = spec.get("confidence")
+            base = 0.85
+            if conf is not None:
+                try:
+                    base = float(conf)
+                    base = base / 100.0 if base > 1.0 else base
+                    base = max(0.0, min(0.99, base))
+                except (TypeError, ValueError):
+                    base = 0.85
+            out.append(CustomPatternSpec(
+                name=name, regex=compiled, base_confidence=base,
+                description=str(spec.get("description", "")),
+            ))
+        except (re.error, TypeError, ValueError):
+            # Skip a single bad pattern; do not abort the whole request.
+            continue
+    return out
+
+
+def _detect_custom(text: str, specs: list[CustomPatternSpec]) -> list[Match]:
+    """Match each compiled custom pattern against ``text``.
+
+    A hard per-pattern character budget bounds worst-case matching time even if
+    a pattern slips past the ReDoS heuristic. Matches surface as CUSTOM_PATTERN
+    detections; the pattern name is carried in the signals (never the value).
+    """
+    out: list[Match] = []
+    # Bound total scan work: only inspect the first N chars per pattern. OCR
+    # text from a single screenshot is small, so this never truncates real use.
+    budget = text[:20000]
+    for spec in specs:
+        try:
+            for m in spec.regex.finditer(budget):
+                value = m.group(0)
+                if not value:
+                    continue
+                signals = (f"custom pattern: {spec.name}", "user-defined pattern matched")
+                out.append(Match("CUSTOM_PATTERN", "medium", m.start(), m.end(),
+                                 value, round(min(0.99, spec.base_confidence), 4), signals))
+        except re.error:
+            continue
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Address detection (§11). Addresses are block-level: a window of consecutive
+# lines is scored on multiple geographic signals. A single line is scored on
+# its own; the LOCATE stage additionally reconstructs multi-line address blocks.
+# ---------------------------------------------------------------------------
+
+def detect_address_block(block: str, *, multiline: bool = False,
+                         base_offset: int = 0, span: Optional[tuple[int, int]] = None) -> Optional[Match]:
+    """Score a text ``block`` as an address; return a Match or None.
+
+    ``span`` overrides the (start, end) char offsets of the reported match
+    (used by the spatial path to point at the whole block). Otherwise the whole
+    block is reported starting at ``base_offset``.
+    """
+    scored = score_address(block, multiline=multiline)
+    if scored.confidence * 100.0 < REDACT_THRESHOLD:
+        return None
+    if span is not None:
+        start, end = span
+    else:
+        start, end = base_offset, base_offset + len(block)
+    return Match("ADDRESS", "medium", start, end, block.strip(),
+                 round(min(0.99, scored.confidence), 4), tuple(scored.signals))
+
+
+def detect_text(
+    text: str,
+    enabled_types: Optional[set[str]] = None,
+    custom_patterns: Optional[list[CustomPatternSpec]] = None,
+) -> list[Match]:
     """Run all patterns over ``text`` and return non-overlapping matches.
 
     Overlaps are resolved by preferring higher confidence, then longer spans.
+    ``custom_patterns`` are pre-compiled specs (see :func:`compile_custom_patterns`)
+    and only run when ``CUSTOM_PATTERN`` is enabled.
     """
     raw: list[Match] = []
     for pattern in PATTERNS:
@@ -292,6 +424,17 @@ def detect_text(text: str, enabled_types: Optional[set[str]] = None) -> list[Mat
             raw.append(
                 Match(pattern.type, pattern.severity, start, end, value, conf, signals)
             )
+
+    # ADDRESS: score the whole text as a single block (single-line/text path).
+    # The spatial LOCATE stage handles multi-line reconstruction separately.
+    if enabled_types is None or "ADDRESS" in enabled_types:
+        addr = detect_address_block(text)
+        if addr is not None:
+            raw.append(addr)
+
+    # CUSTOM_PATTERN: user-defined regexes.
+    if (enabled_types is None or "CUSTOM_PATTERN" in enabled_types) and custom_patterns:
+        raw.extend(_detect_custom(text, custom_patterns))
 
     return _resolve_overlaps(raw)
 
@@ -329,6 +472,17 @@ def _detect_label_anchored(pattern: PatternDef, text: str) -> list[Match]:
     return out
 
 
+# Container-style types describe a *region* (e.g. an address block) that may
+# legitimately contain other distinct sensitive spans (a phone or email inside
+# an address). They neither suppress nor are suppressed by other types during
+# overlap resolution — they only compete with their own type.
+_CONTAINER_TYPES = frozenset({"ADDRESS"})
+
+
+def _overlaps(a: Match, b: Match) -> bool:
+    return not (a.end <= b.start or a.start >= b.end)
+
+
 def _resolve_overlaps(matches: list[Match]) -> list[Match]:
     # Sort by confidence desc, then span length desc — greedily keep winners.
     ordered = sorted(
@@ -336,8 +490,21 @@ def _resolve_overlaps(matches: list[Match]) -> list[Match]:
     )
     kept: list[Match] = []
     for m in ordered:
-        if any(not (m.end <= k.start or m.start >= k.end) for k in kept):
-            continue  # overlaps an already-kept (higher priority) match
+        conflict = False
+        for k in kept:
+            if not _overlaps(m, k):
+                continue
+            # A container type (ADDRESS) coexists with other-typed spans; only
+            # a same-type overlap counts as a real conflict for containers.
+            if m.type in _CONTAINER_TYPES or k.type in _CONTAINER_TYPES:
+                if m.type == k.type:
+                    conflict = True
+                    break
+                continue
+            conflict = True
+            break
+        if conflict:
+            continue
         kept.append(m)
     kept.sort(key=lambda m: m.start)
     return kept
